@@ -8,6 +8,7 @@
 mod flusher;
 pub mod hash;
 pub mod mem_odb;
+pub mod midx;
 pub mod odb;
 pub mod pack;
 pub mod registry;

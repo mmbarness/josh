@@ -23,13 +23,13 @@ pub(crate) fn objects_dir(repo: &gix::Repository) -> std::path::PathBuf {
 
 /// Compress and write the objects of `snapshot` that are not already present in `objects_dir`
 /// (loose, packed, or via alternates) as a single packfile-plus-index pair in
-/// `objects_dir/pack`. A no-op if every object is already on disk.
+/// `objects_dir/pack`. A no-op if every object is already on disk; returns whether it wrote a pack.
 ///
 /// The pack is deterministic for a given snapshot: entries use the fastest zlib level and are
 /// serialized single-threaded in snapshot order, and the file pair is named after the pack
 /// trailer checksum, so identical snapshots produce identical packs. Files are written via
 /// tempfile-and-rename, index last, so a concurrent reader never sees a torn pair.
-pub(crate) fn write_snapshot(objects_dir: &Path, snapshot: &Snapshot) -> anyhow::Result<()> {
+pub(crate) fn write_snapshot(objects_dir: &Path, snapshot: &Snapshot) -> anyhow::Result<bool> {
     // A fresh store handle per flush observes every pack written by previous flushes. Misses are
     // the expected case below, and the default refresh mode re-lists the pack directory on every
     // miss — disable it; the first lookup still loads all indices present now, and loose-object
@@ -43,7 +43,7 @@ pub(crate) fn write_snapshot(objects_dir: &Path, snapshot: &Snapshot) -> anyhow:
         .map(|(oid, kind, data)| (*oid, *kind, data))
         .collect();
     if to_pack.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
     let num_entries = u32::try_from(to_pack.len()).context("mem-odb pack write failed")?;
 
@@ -114,5 +114,5 @@ pub(crate) fn write_snapshot(objects_dir: &Path, snapshot: &Snapshot) -> anyhow:
     {
         return Err(error).context("mem-odb pack write failed");
     }
-    Ok(())
+    Ok(true)
 }

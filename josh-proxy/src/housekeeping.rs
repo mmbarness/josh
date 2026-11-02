@@ -150,6 +150,17 @@ pub fn run(
     transaction_overlay
         .add_disk_alternate(repo_path.join("mirror").join("objects").to_str().unwrap())?;
 
+    // josh's own flushes keep each multi-pack index current; this covers the packs `git` wrote
+    // since (fetches into the mirror, pushes into the overlay).
+    for (repo, name) in [
+        (&transaction_mirror, "mirror"),
+        (&transaction_overlay, "overlay"),
+    ] {
+        if let Err(error) = josh_core::memodb::midx::maintain(&repo.path().join("objects")) {
+            tracing::warn!(repo = name, error = %error, "multi_pack_index");
+        }
+    }
+
     let mirror_object_count: ParsedCommandResult<CountObjectsOutput> =
         run_command(transaction_mirror.path(), &["git", "count-objects", "-v"]).into();
 
@@ -169,6 +180,8 @@ pub fn run(
     }
 
     if do_gc {
+        // Repacking deletes packs, which a multi-pack index written meanwhile could still list.
+        let _maintenance = josh_core::memodb::midx::exclusive();
         trace_command_result!(
             run_command(
                 transaction_mirror.path(),

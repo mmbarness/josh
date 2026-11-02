@@ -233,8 +233,8 @@ impl MemOdb {
     /// into the object directory captured at construction (see [`crate::pack::write_snapshot`]) —
     /// no repository handle involved. The snapshot shares the object buffers (`Arc`), and the
     /// objects stay in the map while the pack is written, so concurrent reads keep resolving until
-    /// eviction — which happens only once the pack is on disk.
-    pub(crate) fn pack_to_disk(self: &Arc<Self>) -> anyhow::Result<()> {
+    /// eviction — which happens only once the pack is on disk. Returns whether it wrote a pack.
+    pub(crate) fn pack_to_disk(self: &Arc<Self>) -> anyhow::Result<bool> {
         // One packer per store at a time: the flusher's own jobs are already serialised, but the
         // process-exit flush packs inline and would otherwise snapshot and evict concurrently.
         let _packing = self.pack_lock.lock();
@@ -248,7 +248,7 @@ impl MemOdb {
         let snapshot: Snapshot = {
             let inner = self.inner.read();
             if inner.map.is_empty() {
-                return Ok(());
+                return Ok(false);
             }
             inner
                 .map
@@ -257,7 +257,7 @@ impl MemOdb {
                 .collect()
         };
 
-        crate::pack::write_snapshot(&self.objects_dir, &snapshot)?;
+        let wrote = crate::pack::write_snapshot(&self.objects_dir, &snapshot)?;
 
         // Evict exactly the snapshotted oids (now durable: packed just above, or already on disk).
         // Writes that landed after the snapshot stay buffered for the next chunk or the drain, so a
@@ -268,7 +268,19 @@ impl MemOdb {
                 inner.size = inner.size.saturating_sub(data.len());
             }
         }
-        Ok(())
+        Ok(wrote)
+    }
+
+    /// Bring the multi-pack index of this store's objects directory up to date after a pack was
+    /// written (see [`crate::midx`]). Failing to is not fatal: the packs stay readable, and the
+    /// next call covers them.
+    pub(crate) fn maintain_multi_pack_index(&self) {
+        if let Err(error) = crate::midx::maintain(&self.objects_dir) {
+            log::warn!(
+                "failed to write multi-pack index in {}: {error}",
+                self.objects_dir.display()
+            );
+        }
     }
 }
 

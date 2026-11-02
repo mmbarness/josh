@@ -15,7 +15,9 @@
 //! its drain — and no two packs are ever written from the same store concurrently. A job carries
 //! the store's `Arc`; the worker snapshots the buffered objects and packs them with gix-pack
 //! straight into the store's object directory (see [`crate::pack`]) — no repository handle
-//! involved.
+//! involved. After writing a pack, the job brings the directory's multi-pack index up to date
+//! (see [`crate::midx`]) before it acknowledges, so a store never has more than a bounded number
+//! of packs outside it once a flush returns.
 
 use std::sync::Arc;
 use std::sync::LazyLock;
@@ -53,7 +55,12 @@ impl Flusher {
                     match job {
                         Job::Chunk { store } => {
                             let packed = match store.pack_to_disk() {
-                                Ok(()) => true,
+                                Ok(wrote) => {
+                                    if wrote {
+                                        store.maintain_multi_pack_index();
+                                    }
+                                    true
+                                }
                                 Err(e) => {
                                     log::error!("background chunk flush failed: {e}");
                                     false
@@ -62,7 +69,11 @@ impl Flusher {
                             store.finish_chunk(packed);
                         }
                         Job::Drain { store, ack } => {
-                            let _ = ack.send(store.pack_to_disk().map_err(|e| e.to_string()));
+                            let result = store.pack_to_disk();
+                            if let Ok(true) = result {
+                                store.maintain_multi_pack_index();
+                            }
+                            let _ = ack.send(result.map(|_| ()).map_err(|e| e.to_string()));
                         }
                     }
                 }
