@@ -127,17 +127,21 @@ pub fn filter_commit(
     // has to see the transaction's buffered objects.
     let original_commit = objects::peel_to_commit(transaction.odb(), oid)?;
 
-    let filter_commit = if let Some(s) = transaction
-        .memo()
-        .references
-        .get(&filterobj.id(), &oid)
-        .filter(|oid| transaction.odb().contains(*oid))
-    {
-        s
-    } else {
-        tracing::trace!("apply_to_commit");
+    let cached = transaction.memo().references.get(&filterobj.id(), &oid);
+    let filter_commit = match cached {
+        Some(s)
+            if transaction
+                .odb()
+                .try_contains(&s)
+                .map_err(|e| anyhow::anyhow!("cache lookup of {}: {}", s, e))? =>
+        {
+            s
+        }
+        _ => {
+            tracing::trace!("apply_to_commit");
 
-        filter::apply_to_commit(filterobj, original_commit, transaction)?
+            filter::apply_to_commit(filterobj, original_commit, transaction)?
+        }
     };
 
     transaction
@@ -167,13 +171,14 @@ pub fn filter_refs(
         let oid = match filter_commit(transaction, filterobj, k.1) {
             Ok(oid) => oid,
             Err(e) => {
-                errors.push((k.0.to_string(), e));
                 tracing::event!(
                     tracing::Level::WARN,
                     msg = "filter_refs: Can't filter reference",
                     warn = true,
                     from = k.0.as_str(),
+                    error = %e,
                 );
+                errors.push((k.0.to_string(), e));
                 gix_hash::ObjectId::null(gix_hash::Kind::Sha1)
             }
         };

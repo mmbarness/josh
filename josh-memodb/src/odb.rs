@@ -49,15 +49,70 @@ impl std::ops::Deref for Bytes {
 /// See the module docs. Built by `Transaction::odb()` and held for the transaction.
 pub struct Odb {
     mem: Arc<MemOdb>,
-    /// The repository's own objects. Handles taken from one store share its loaded pack
-    /// indices, so every transaction on a repository pays for them once between them.
-    disk: gix_odb::Handle,
+    /// The repository's own objects. Replaced by [`Odb::on_disk`] when its store runs out of
+    /// slots.
+    disk: RefCell<Disk>,
+    /// Opens a replacement for the repository's store when it has run out of slots.
+    reopen: Reopen,
+    /// Object directories registered after the repository was opened; see the module docs.
+    alternates: RefCell<Vec<Alternate>>,
+}
+
+/// Opens a replacement for an object store that has run out of slots, given that store. See
+/// [`Odb::with_reopen`].
+pub type Reopen =
+    Box<dyn Fn(&OwnShared<gix_odb::Store>) -> std::io::Result<OwnShared<gix_odb::Store>> + Send>;
+
+/// The repository's store and the two readers taken from it.
+struct Disk {
+    store: OwnShared<gix_odb::Store>,
+    /// Refreshes on a miss. Handles taken from one store share its loaded pack indices, so every
+    /// transaction on a repository pays for them once between them.
+    read: gix_odb::Handle,
     /// A non-refreshing reader for the same store. Proxy objects live either here or in an
     /// alternate; probing both snapshots before either refreshing avoids a directory rescan
     /// for every object held by the other store.
-    disk_fast: gix_odb::Handle,
-    /// Object directories registered after the repository was opened; see the module docs.
-    alternates: RefCell<Vec<Alternate>>,
+    fast: gix_odb::Handle,
+}
+
+impl Disk {
+    fn new(store: OwnShared<gix_odb::Store>) -> Disk {
+        let mut fast = handle(store.clone());
+        fast.refresh_never();
+        Disk {
+            read: handle(store.clone()),
+            fast,
+            store,
+        }
+    }
+}
+
+/// A store's slot count is fixed when it opens. Once its pack indices outgrow it, every refresh
+/// fails with this error, so objects in packs written since can't be read.
+fn out_of_slots(error: &(dyn std::error::Error + 'static)) -> bool {
+    use gix_odb::store::{find, load_index};
+    matches!(
+        error.downcast_ref::<find::Error>(),
+        Some(find::Error::LoadIndex(
+            load_index::Error::InsufficientSlots { .. }
+        ))
+    ) || matches!(
+        error.downcast_ref::<load_index::Error>(),
+        Some(load_index::Error::InsufficientSlots { .. })
+    )
+}
+
+/// The default [`Reopen`]: a new store on the same directory, sized to its pack indices now.
+fn reopen_at_disk_state(
+    stale: &OwnShared<gix_odb::Store>,
+) -> std::io::Result<OwnShared<gix_odb::Store>> {
+    let options = gix_odb::store::init::Options {
+        object_hash: stale.object_hash(),
+        use_multi_pack_index: stale.use_multi_pack_index(),
+        ..Default::default()
+    };
+    gix_odb::Store::at_opts(stale.path().to_owned(), &mut stale.replacements(), options)
+        .map(OwnShared::new)
 }
 
 /// A runtime alternate with snapshot and refreshing readers plus a write-dedup gate.
@@ -103,13 +158,43 @@ impl Odb {
     /// store from a repository handle so its pack indices are shared between transactions;
     /// [`Odb::at`] opens one for a bare objects directory.
     pub fn new(mem: Arc<MemOdb>, store: OwnShared<gix_odb::Store>) -> Self {
-        let mut disk_fast = handle(store.clone());
-        disk_fast.refresh_never();
         Odb {
             mem,
-            disk: handle(store),
-            disk_fast,
+            disk: RefCell::new(Disk::new(store)),
+            reopen: Box::new(reopen_at_disk_state),
             alternates: Default::default(),
+        }
+    }
+
+    /// Use `reopen` to replace the repository's store when it runs out of slots, instead of
+    /// opening a new store just for this facade. Lets the owner of a store that many facades
+    /// share replace it for all of them.
+    pub fn with_reopen(
+        mut self,
+        reopen: impl Fn(&OwnShared<gix_odb::Store>) -> std::io::Result<OwnShared<gix_odb::Store>>
+        + Send
+        + 'static,
+    ) -> Self {
+        self.reopen = Box::new(reopen);
+        self
+    }
+
+    /// Run `lookup` on the refreshing reader of the repository's store. A store that has run
+    /// out of slots fails every refresh from then on; replace it (see [`Reopen`]) and retry
+    /// once.
+    fn on_disk<T>(
+        &self,
+        mut lookup: impl FnMut(&gix_odb::Handle) -> Result<T, gix_object::find::Error>,
+    ) -> Result<T, gix_object::find::Error> {
+        let result = lookup(&self.disk.borrow().read);
+        match result {
+            Err(error) if out_of_slots(&*error) => {
+                let stale = self.disk.borrow().store.clone();
+                let store = (self.reopen)(&stale)?;
+                *self.disk.borrow_mut() = Disk::new(store);
+                lookup(&self.disk.borrow().read)
+            }
+            result => result,
         }
     }
 
@@ -190,7 +275,7 @@ impl Odb {
         id: &gix_hash::oid,
         buffer: &mut Vec<u8>,
     ) -> Result<Option<Kind>, gix_object::find::Error> {
-        if let Some(data) = self.disk_fast.try_find(id, buffer)? {
+        if let Some(data) = self.disk.borrow().fast.try_find(id, buffer)? {
             return Ok(Some(data.kind));
         }
         for alternate in self.alternates.borrow().iter() {
@@ -198,8 +283,10 @@ impl Odb {
                 return Ok(Some(data.kind));
             }
         }
-        if let Some(data) = self.disk.try_find(id, buffer)? {
-            return Ok(Some(data.kind));
+        if let Some(kind) =
+            self.on_disk(|disk| Ok(disk.try_find(id, buffer)?.map(|data| data.kind)))?
+        {
+            return Ok(Some(kind));
         }
         for alternate in self.alternates.borrow().iter() {
             if let Some(data) = alternate.read.try_find(id, buffer)? {
@@ -215,12 +302,30 @@ impl Odb {
             .ok_or_else(|| anyhow::anyhow!("object not found - no match for id ({})", id))
     }
 
+    /// Whether any store holds `id`. A store that can't be read counts as not holding it, but
+    /// is logged; [`Odb::try_contains`] reports it instead.
     pub fn contains(&self, id: ObjectId) -> bool {
-        self.mem.contains(&id)
-            || self.disk_fast.exists(&id)
-            || self.in_alternate_fast(&id)
-            || self.disk.exists(&id)
-            || self.in_alternate(&id)
+        self.try_contains(&id).unwrap_or_else(|error| {
+            log::error!("failed to look up {id}: {error}");
+            false
+        })
+    }
+
+    /// [`Odb::contains`], failing when the repository's store can't be read rather than
+    /// reporting the object as missing.
+    pub fn try_contains(&self, id: &gix_hash::oid) -> Result<bool, gix_object::find::Error> {
+        if self.mem.contains(id) {
+            return Ok(true);
+        }
+        let in_snapshot = self.disk.borrow().fast.exists(id);
+        if in_snapshot || self.in_alternate_fast(id) {
+            return Ok(true);
+        }
+        // `exists` would report a failed refresh as a miss; a header lookup reports it.
+        if self.on_disk(|disk| disk.try_header(id))?.is_some() {
+            return Ok(true);
+        }
+        Ok(self.in_alternate(id))
     }
 
     /// Kind of `id`, or `None` if the object does not exist. Never decompresses. Resolves the
@@ -309,7 +414,7 @@ impl gix_object::FindHeader for Odb {
                 size: 0,
             }));
         }
-        if let Some(header) = self.disk_fast.try_header(id)? {
+        if let Some(header) = self.disk.borrow().fast.try_header(id)? {
             return Ok(Some(header));
         }
         for alternate in self.alternates.borrow().iter() {
@@ -317,7 +422,7 @@ impl gix_object::FindHeader for Odb {
                 return Ok(Some(header));
             }
         }
-        if let Some(header) = self.disk.try_header(id)? {
+        if let Some(header) = self.on_disk(|disk| disk.try_header(id))? {
             return Ok(Some(header));
         }
         for alternate in self.alternates.borrow().iter() {
@@ -331,11 +436,7 @@ impl gix_object::FindHeader for Odb {
 
 impl gix_object::Exists for Odb {
     fn exists(&self, id: &gix_hash::oid) -> bool {
-        self.mem.contains(id)
-            || self.disk_fast.exists(id)
-            || self.in_alternate_fast(id)
-            || self.disk.exists(id)
-            || self.in_alternate(id)
+        self.contains(id.to_owned())
     }
 }
 
@@ -384,6 +485,28 @@ mod tests {
 
     fn facade(store: &Arc<MemOdb>, repo: &gix::Repository) -> Odb {
         Odb::at(store.clone(), &crate::pack::objects_dir(repo)).unwrap()
+    }
+
+    /// A store whose slots run out is reopened, sized to the packs on disk, instead of reporting
+    /// objects in newer packs as missing.
+    #[test]
+    fn store_out_of_slots_is_reopened() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = gix::init_bare(dir.path()).unwrap();
+        let objects_dir = crate::pack::objects_dir(&repo);
+        let mem = MemOdb::new(None, objects_dir.clone());
+        let options = gix_odb::store::init::Options {
+            slots: gix_odb::store::init::Slots::Given(1),
+            ..Default::default()
+        };
+        let store = gix_odb::Store::at_opts(objects_dir, &mut std::iter::empty(), options).unwrap();
+        let odb = Odb::new(mem.clone(), OwnShared::new(store));
+        for i in 0..3u8 {
+            let oid = mem.write(Kind::Blob, &[i]);
+            mem.flush().unwrap();
+            assert!(odb.try_contains(&oid).unwrap());
+            assert_eq!(&*odb.read(oid).unwrap().1, &[i]);
+        }
     }
 
     /// A facade write is served from memory (zero-copy), is invisible to a plain reopened

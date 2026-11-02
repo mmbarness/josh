@@ -123,6 +123,37 @@ fn shared_gix_repo(
         return Ok(repo.clone());
     }
 
+    let repo = std::sync::Arc::new(open_gix_repo(path)?);
+    repos.insert(path.to_owned(), repo.clone());
+
+    Ok(repo)
+}
+
+/// Replace the shared repository for `path` once its object store `stale` has run out of slots,
+/// unless another transaction has already. gix fixes a store's slot count when it opens it, so
+/// the new one is sized to the pack indices on disk now.
+fn reopen_shared_gix_repo(
+    path: &std::path::Path,
+    stale: &std::sync::Arc<gix::odb::Store>,
+) -> anyhow::Result<std::sync::Arc<gix::ThreadSafeRepository>> {
+    let mut repos = GIX_REPOS.write().unwrap();
+    if let Some(repo) = repos.get(path)
+        && !std::sync::Arc::ptr_eq(&repo.objects, stale)
+    {
+        return Ok(repo.clone());
+    }
+
+    let repo = std::sync::Arc::new(open_gix_repo(path)?);
+    tracing::warn!(
+        path = %path.display(),
+        "object store ran out of slots; reopened it sized to the packs on disk"
+    );
+    repos.insert(path.to_owned(), repo.clone());
+
+    Ok(repo)
+}
+
+fn open_gix_repo(path: &std::path::Path) -> anyhow::Result<gix::ThreadSafeRepository> {
     // Object-database environment overrides must not affect a transaction opened for an
     // explicit path. System, user and repository configuration plus identity environment
     // variables remain available to configuration and identity queries.
@@ -132,10 +163,7 @@ fn shared_gix_repo(
     options.permissions.env.xdg_config_home = gix::sec::Permission::Allow;
     options.permissions.env.home = gix::sec::Permission::Allow;
     options.permissions.env.identity = gix::sec::Permission::Allow;
-    let repo = std::sync::Arc::new(gix::ThreadSafeRepository::open_opts(path, options)?);
-    repos.insert(path.to_owned(), repo.clone());
-
-    Ok(repo)
+    Ok(gix::ThreadSafeRepository::open_opts(path, options)?)
 }
 
 impl TransactionContext {
@@ -188,6 +216,7 @@ impl TransactionContext {
         let gix_repo = shared_gix_repo(&self.path)?;
 
         Ok(Transaction::new(
+            &self.path,
             gix_repo,
             self.cache.clone(),
             self.ref_prefix.as_deref(),
@@ -289,6 +318,7 @@ impl Drop for Transaction {
 
 impl Transaction {
     fn new(
+        path: &std::path::Path,
         gix_repo: std::sync::Arc<gix::ThreadSafeRepository>,
         cache: std::sync::Arc<CacheStack>,
         ref_prefix: Option<&str>,
@@ -305,8 +335,16 @@ impl Transaction {
             shared
         };
         // The store the repository was opened with, so pack indices are loaded once for every
-        // transaction of this context.
-        let odb = josh_memodb::Odb::new(mem_odb.clone(), gix_repo.objects.clone());
+        // transaction of this context. If it runs out of slots, every later transaction gets the
+        // replacement too.
+        let path = path.to_owned();
+        let odb = josh_memodb::Odb::new(mem_odb.clone(), gix_repo.objects.clone()).with_reopen(
+            move |stale| {
+                reopen_shared_gix_repo(&path, stale)
+                    .map(|repo| repo.objects.clone())
+                    .map_err(std::io::Error::other)
+            },
+        );
 
         // Balanced in `Drop`; lets a locking backend (sled) hold its lock only while a
         // transaction is live.
@@ -1164,9 +1202,13 @@ impl Transaction {
                 return Ok(Some(oid));
             }
 
-            if self.odb().contains(oid) {
-                // Only report an object as cached if it exists in the object database.
-                // This forces a rebuild in case the object was garbage collected.
+            // Only report an object as cached if it exists in the object database.
+            // This forces a rebuild in case the object was garbage collected.
+            if self
+                .odb()
+                .try_contains(&oid)
+                .map_err(|e| anyhow!("cache lookup of {}: {}", oid, e))?
+            {
                 return Ok(Some(oid));
             }
         }
@@ -2021,6 +2063,20 @@ mod tests {
                     .count()
             })
             .unwrap_or(0)
+    }
+
+    /// The repository kept for a path must find packs flushed long after it was opened, past
+    /// gix's default of 32 slots.
+    #[test]
+    fn shared_repository_reads_packs_written_after_it_was_opened() {
+        let (dir, context) = test_context();
+        for i in 0..40u8 {
+            let transaction = context.open().unwrap();
+            let oid = transaction.odb().write(gix_object::Kind::Blob, &[i]);
+            transaction.flush_mem_odb().unwrap();
+            assert_eq!(packs(dir.path()), usize::from(i) + 1);
+            assert_eq!(&*transaction.odb().read(oid).unwrap().1, &[i]);
+        }
     }
 
     /// The store outlives the transaction that filled it: a transaction that publishes nothing
